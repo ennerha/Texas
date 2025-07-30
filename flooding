@@ -1,0 +1,185 @@
+!pip install xgboost lightgbm catboost scikit-learn rasterio shapely tqdm matplotlib seaborn geopandas --quiet
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import rasterio
+import geopandas as gpd
+from shapely.geometry import Point
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.neural_network import MLPClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+import joblib
+
+# Caminho da pasta no Google Drive
+folder = '/content/drive/MyDrive/Texas'
+
+# Variáveis preditoras (inclui CHIRPS)
+selected_vars = [
+    "Valley Depth",
+    "EucDistance_StreamL1",
+    "DEM_ProjectRaster",
+    "LS-Factor",
+    "CHIRPS_acumulado_7dias",
+    "Landforms_reclass",
+    "Topographic Wetness Index",
+    "Hillshade_Radians",
+    "CN",
+]
+
+var_renames = {'2025-07-04': 'CHIRPS_precip'}
+target_var = 'Flood_binary'
+
+# 1. Carregar raster de referência (Flood_binary)
+with rasterio.open(os.path.join(folder, f"{target_var}.tif")) as src:
+    y_data = src.read(1)
+    profile = src.profile
+    transform = src.transform
+    crs_raster = src.crs
+    base_shape = y_data.shape
+
+# 2. Determinar menor shape comum entre todos os rasters
+min_rows, min_cols = base_shape
+for var in selected_vars:
+    with rasterio.open(os.path.join(folder, f"{var}.tif")) as src:
+        r, c = src.shape
+        min_rows = min(min_rows, r)
+        min_cols = min(min_cols, c)
+
+# 3. Cortar raster de referência para shape comum
+y_data = y_data[:min_rows, :min_cols]
+
+# 4. Carregar shapefile e gerar máscara de polígono
+gdf_limite = gpd.read_file(os.path.join(folder, 'Basin.shp'))
+gdf_limite = gdf_limite.to_crs(crs_raster)
+
+# 5. Nova amostragem: gerar grade sobre a bacia
+espacamento = 500  # metros
+max_samples_per_class = 1000
+
+bounds = gdf_limite.total_bounds
+x_min, y_min, x_max, y_max = bounds
+x_vals = np.arange(x_min, x_max, espacamento)
+y_vals = np.arange(y_min, y_max, espacamento)
+
+grid_points = [Point(x, y) for x in x_vals for y in y_vals]
+gdf_grid = gpd.GeoDataFrame(geometry=grid_points, crs=gdf_limite.crs)
+gdf_pontos_bacia = gdf_grid[gdf_grid.within(gdf_limite.unary_union)]
+
+sample_coords = [(p.x, p.y) for p in gdf_pontos_bacia.geometry]
+with rasterio.open(os.path.join(folder, f"{target_var}.tif")) as src:
+    sampled_vals = list(src.sample(sample_coords))
+    sampled_vals = np.array(sampled_vals).flatten()
+
+valid_idx = np.where(np.isin(sampled_vals, [0, 1]))[0]
+coords_validos = np.array(sample_coords)[valid_idx]
+classes_validas = sampled_vals[valid_idx]
+
+df_amostras = pd.DataFrame(coords_validos, columns=["x", "y"])
+df_amostras["classe"] = classes_validas
+
+amostras_0 = df_amostras[df_amostras.classe == 0].sample(n=max_samples_per_class, random_state=42)
+amostras_1 = df_amostras[df_amostras.classe == 1].sample(n=max_samples_per_class, random_state=42)
+df_amostras_final = pd.concat([amostras_0, amostras_1])
+
+coords_amostras = list(zip(df_amostras_final["x"], df_amostras_final["y"]))
+labels = df_amostras_final["classe"].values
+
+# 6. Leitura dos valores das variáveis para as amostras
+X = []
+for var in tqdm(selected_vars):
+    path = os.path.join(folder, f"{var}.tif")
+    with rasterio.open(path) as src:
+        vals = list(src.sample(coords_amostras))
+        vals = np.array(vals).flatten()
+        X.append(vals)
+X = np.array(X).T
+var_names = [var_renames.get(v, v) for v in selected_vars]
+
+# 7. Visualização espacial das amostras com shapefile
+plt.figure(figsize=(12, 8))
+ax = plt.gca()
+gdf_limite.boundary.plot(ax=ax, edgecolor='black', linewidth=1.2, label='Study area boundary')
+
+x_coords, y_coords = zip(*coords_amostras)
+x_coords = np.array(x_coords)
+y_coords = np.array(y_coords)
+
+plt.scatter(x_coords[labels == 1], y_coords[labels == 1], c='red', s=8, label='Flooded (1)')
+plt.scatter(x_coords[labels == 0], y_coords[labels == 0], c='blue', s=8, label='Not Flooded (0)')
+
+plt.title("Spatial distribution of samples with study area boundary")
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# 8. Divisão treino-teste
+X_train, X_test, y_train, y_test = train_test_split(X, labels, stratify=labels, test_size=0.3, random_state=42)
+
+# 9. Normalização para modelos sensíveis à escala
+scaler = StandardScaler().fit(X_train)
+X_train_std = scaler.transform(X_train)
+X_test_std = scaler.transform(X_test)
+
+# 10. Modelos de machine learning
+modelos = {
+    "Logistic Regression": LogisticRegression(max_iter=1000),
+    "SVM (RBF)": SVC(probability=True),
+    "MLP": MLPClassifier(max_iter=1000),
+    "Random Forest": RandomForestClassifier(),
+    "Decision Tree": DecisionTreeClassifier(),
+    "XGBoost": XGBClassifier(verbosity=0),
+    "LightGBM": LGBMClassifier(),
+    "CatBoost": CatBoostClassifier(verbose=0)
+}
+
+# 11. Avaliação
+resultados = []
+for nome, modelo in tqdm(modelos.items()):
+    if nome in ["Logistic Regression", "SVM (RBF)", "MLP"]:
+        modelo.fit(X_train_std, y_train)
+        y_pred = modelo.predict(X_test_std)
+        y_prob = modelo.predict_proba(X_test_std)[:, 1]
+    else:
+        modelo.fit(X_train, y_train)
+        y_pred = modelo.predict(X_test)
+        y_prob = modelo.predict_proba(X_test)[:, 1]
+
+    resultados.append({
+        "Modelo": nome,
+        "Accuracy": accuracy_score(y_test, y_pred),
+        "Precision": precision_score(y_test, y_pred),
+        "Recall": recall_score(y_test, y_pred),
+        "F1-Score": f1_score(y_test, y_pred),
+        "ROC AUC": roc_auc_score(y_test, y_prob)
+    })
+
+# 12. Tabela de métricas
+df_resultados = pd.DataFrame(resultados)
+df_resultados['Average of F1-score and AUC'] = (df_resultados['F1-Score'] + df_resultados['ROC AUC']) / 2
+df_resultados = df_resultados.sort_values(by='Average of F1-score and AUC', ascending=False)
+print("\n📊 Model performance table:\n")
+print(df_resultados)
+
+# 13. Salvar melhor modelo
+melhor_nome = df_resultados.iloc[0]['Modelo']
+melhor_modelo = modelos[melhor_nome]
+joblib.dump(melhor_modelo, '/content/melhor_modelo.pkl')
+print(f"\n✅ Melhor modelo: {melhor_nome} salvo como 'melhor_modelo.pkl'")
+
+df_amostras_final[var_names] = X  # Adiciona as colunas preditoras às coordenadas e classe
+df_amostras_final.to_csv('/content/drive/MyDrive/Texas/amostras_balanceadas.csv', index=False)
+
