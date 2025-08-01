@@ -1,0 +1,96 @@
+!pip install rasterio geopandas scikit-learn catboost tqdm matplotlib --quiet
+
+import rasterio
+import numpy as np
+import joblib
+from tqdm import tqdm
+import os
+import matplotlib.pyplot as plt
+import geopandas as gpd
+from rasterio.windows import Window
+from rasterio.features import geometry_mask
+import gc
+
+# Caminhos
+folder_pred = '/content/drive/MyDrive/Texas/rasters_alinhados_final'
+output_path = '/content/drive/MyDrive/Texas/Mapa_Inundacao_Previsto.tif'
+shapefile_path = '/content/drive/MyDrive/Texas/Basin.shp'
+
+# Variáveis preditoras
+selected_vars = [
+    "Valley Depth", "EucDistance_StreamL1", "DEM_ProjectRaster", "LS-Factor",
+    "CHIRPS_acumulado_7dias", "Landforms_reclass", "Topographic Wetness Index",
+    "Hillshade_Radians", "CN"
+]
+
+# Raster de referência
+with rasterio.open(os.path.join(folder_pred, f"{selected_vars[0]}.tif")) as src:
+    meta = src.meta.copy()
+    rows, cols = src.shape
+    transform = src.transform
+    crs_raster = src.crs
+
+# Carregar modelo treinado
+modelo = joblib.load('/content/melhor_modelo.pkl')
+
+# Carregar shapefile de limite
+gdf_limite = gpd.read_file(shapefile_path).to_crs(crs_raster)
+mask_geom = [feature for feature in gdf_limite.geometry]
+mask_raster = geometry_mask(mask_geom, transform=transform, invert=True, out_shape=(rows, cols))
+
+# Abrir todos os rasters
+raster_objs = {
+    var: rasterio.open(os.path.join(folder_pred, f"{var}.tif")) for var in selected_vars
+}
+
+# Atualizar metadados para salvar como float32 (0 a 1)
+meta.update(dtype=rasterio.float32, count=1, compress='lzw', nodata=np.nan)
+
+# Criar raster de saída
+dst_probs = rasterio.open(output_path, 'w', **meta)
+
+# Tamanho do bloco
+block_size = 128
+
+for i in tqdm(range(0, rows, block_size), desc="Gerando mapa contínuo de suscetibilidade"):
+    for j in range(0, cols, block_size):
+        win_rows = min(block_size, rows - i)
+        win_cols = min(block_size, cols - j)
+        window = Window(j, i, win_cols, win_rows)
+        mask_win = mask_raster[i:i+win_rows, j:j+win_cols]
+        if not np.any(mask_win):
+            continue
+
+        try:
+            stack = np.stack([
+                raster_objs[var].read(1, window=window) for var in selected_vars
+            ])
+        except Exception as e:
+            print(f"❌ Erro ao ler bloco ({i},{j}): {e}")
+            continue
+
+        X_block = stack[:, mask_win].T
+        valido = ~np.isnan(X_block).any(axis=1)
+        bloco_probs = np.full((win_rows, win_cols), np.nan, dtype=np.float32)
+
+        if np.sum(valido) > 0:
+            try:
+                probs_validos = modelo.predict_proba(X_block[valido])[:, 1]
+                idx_rows, idx_cols = np.where(mask_win)
+                valid_idx = np.where(valido)[0]
+                for k_idx, prob in zip(valid_idx, probs_validos):
+                    r, c = idx_rows[k_idx], idx_cols[k_idx]
+                    bloco_probs[r, c] = prob
+            except Exception as e:
+                print(f"❌ Erro de previsão em bloco ({i},{j}): {e}")
+
+        dst_probs.write(bloco_probs, 1, window=window)
+        del stack, X_block, bloco_probs
+        gc.collect()
+
+# Fechar arquivos
+dst_probs.close()
+for src in raster_objs.values():
+    src.close()
+
+print("✅ Mapa de suscetibilidade contínuo salvo em:", output_path)
