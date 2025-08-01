@@ -1,0 +1,72 @@
+# Reinstala versões compatíveis com dice-ml e Google Colab
+!pip install numpy==1.26.4 pandas==2.2.2 scikit-learn==1.2.2 --quiet
+!pip install dice-ml==0.9 catboost --quiet
+# === 1. Imports ===
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import joblib
+from catboost import CatBoostClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score
+import dice_ml
+from dice_ml import Dice
+
+# === 2. Caminhos ===
+caminho_csv = '/content/drive/MyDrive/Texas/amostras_balanceadas.csv'
+caminho_modelo = '/content/melhor_modelo.pkl'
+
+# === 3. Carregar dados ===
+df = pd.read_csv(caminho_csv)
+X = df.drop(columns=['x', 'y', 'classe'])
+y = df['classe']
+feature_names = X.columns.tolist()
+
+# === 4. Treinar modelo CatBoost ===
+modelo = CatBoostClassifier(verbose=0, random_state=42)
+modelo.fit(X, y)
+y_pred = modelo.predict(X)
+print("✅ F1-score no conjunto total:", f1_score(y, y_pred))
+
+# === 5. Salvar modelo ===
+joblib.dump(modelo, caminho_modelo)
+
+# === 6. Preparar DiCE ===
+data_dice = dice_ml.Data(dataframe=pd.concat([X, y], axis=1),
+                         continuous_features=feature_names,
+                         outcome_name='classe')
+model_dice = dice_ml.Model(model=modelo, backend='sklearn')
+exp = Dice(data_dice, model_dice, method='random')
+
+# === 7. Gerar contrafactual para primeira instância ===
+query_instance = X.iloc[[0]]
+cf = exp.generate_counterfactuals(query_instance, total_CFs=1, desired_class="opposite")
+cf_df = cf.cf_examples_list[0].final_cfs_df
+
+# === 8. Mostrar comparativo ===
+print("\n🔍 Instância original (classe: {})".format(int(y.iloc[0])))
+print(query_instance.assign(classe=int(y.iloc[0])))
+
+print("\n🧪 Contrafactual (nova classe: {})".format(int(cf_df['classe'].iloc[0])))
+print(cf_df)
+
+# === 9. Gráfico comparativo ===
+original = query_instance.iloc[0]
+cf_vars = cf_df.iloc[0]
+original_vals = original.values.astype(float)
+cf_vals = cf_vars.drop('classe', errors='ignore').values.astype(float)
+variaveis = X.columns.tolist()
+
+cores = ['red' if not np.isclose(o, c) else 'gray' for o, c in zip(original_vals, cf_vals)]
+
+x = np.arange(len(variaveis))
+width = 0.35
+plt.figure(figsize=(12, 6))
+plt.bar(x - width/2, original_vals, width, label='Original', color='blue', alpha=0.7)
+plt.bar(x + width/2, cf_vals, width, label='Counterfactual', color=cores, alpha=0.7)
+plt.xticks(x, variaveis, rotation=45, ha='right', fontsize=12)
+plt.ylabel('Value', fontsize=14)
+plt.legend(fontsize=12)
+plt.grid(axis='y', linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.show()
