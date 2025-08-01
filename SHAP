@@ -1,0 +1,69 @@
+!pip install shap==0.44.1 lime==0.2.0.1 catboost==1.2 dice-ml==0.10.0 scikit-learn==1.2.2 --upgrade --quiet
+import pandas as pd
+import numpy as np
+import joblib
+import shap
+import lime
+import lime.lime_tabular
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+from catboost import CatBoostClassifier
+from sklearn.preprocessing import StandardScaler
+import dice_ml
+from dice_ml import Dice
+
+shap.initjs()
+
+# === Caminhos
+caminho_csv = '/content/drive/MyDrive/Texas/amostras_balanceadas.csv'
+caminho_modelo = '/content/melhor_modelo.pkl'
+
+# === Dados
+df = pd.read_csv(caminho_csv)
+X = df.drop(columns=['x', 'y', 'classe'])
+y = df['classe'].values
+feature_names = X.columns.tolist()
+
+# === Modelo
+modelo = CatBoostClassifier(verbose=0, random_state=42)
+modelo.fit(X, y)
+joblib.dump(modelo, caminho_modelo)
+
+# === SHAP
+print("📊 SHAP summary...")
+explainer_shap = shap.Explainer(modelo, X)
+shap_values = explainer_shap(X)
+shap.summary_plot(shap_values.values, features=X,
+                  feature_names=feature_names, plot_type="violin", show=False)
+plt.savefig("/content/SHAP_beeswarm_nomeado.png", dpi=300, bbox_inches='tight')
+print("✅ SHAP beeswarm salvo!")
+
+# === LIME
+print("🔍 LIME para amostra 0...")
+explainer_lime = lime.lime_tabular.LimeTabularExplainer(
+    training_data=X.values,
+    feature_names=feature_names,
+    class_names=['Not Flooded', 'Flooded'],
+    mode='classification'
+)
+idx = 0
+exp = explainer_lime.explain_instance(X.values[idx], modelo.predict_proba, num_features=8)
+exp.show_in_notebook(show_table=True)
+
+# === DiCE contrafactual
+print("🧪 Contrafactual com DiCE...")
+data_dice = dice_ml.Data(dataframe=pd.concat([X, pd.Series(y, name="classe")], axis=1),
+                         continuous_features=feature_names,
+                         outcome_name='classe')
+model_dice = dice_ml.Model(model=modelo, backend='sklearn')
+exp_dice = Dice(data_dice, model_dice, method='random')
+
+query_instance = X.iloc[[0]]
+cf = exp_dice.generate_counterfactuals(query_instance, total_CFs=1, desired_class="opposite")
+cf_df = cf.cf_examples_list[0].final_cfs_df
+
+print("\nOriginal:", pd.Series(X.iloc[0].values, index=feature_names).round(3))
+print("\nCounterfactual:", pd.Series(cf_df.iloc[0].drop('classe').values, index=feature_names).round(3))
+
